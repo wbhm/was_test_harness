@@ -21,7 +21,8 @@ ENDPOINTS = [
     "wss://echo.websocket.org",
     "wss://ws.postman-echo.com/raw", 
     "wss://ws.vi-server.org/mirror/",
-    "wss://ws.ifelse.io/"
+    "wss://ws.ifelse.io/",
+    "wss://api.enterprise.uneeq.io/signalling-service/v2/ws/renderer"
 ]
 
 def test_http_with_socat(uri, timeout=10):
