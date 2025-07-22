@@ -15,15 +15,60 @@ import shutil
 import base64
 import hashlib
 import os
+import platform
 
 # List of public WebSocket endpoints to test
 ENDPOINTS = [
     "wss://echo.websocket.org",
     "wss://ws.postman-echo.com/raw", 
     "wss://ws.vi-server.org/mirror/",
-    "wss://ws.ifelse.io/",
-    "wss://api.enterprise.uneeq.io/signalling-service/v2/ws/renderer"
+    "wss://ws.ifelse.io/"
 ]
+
+def get_timeout_command():
+    """
+    Get the appropriate timeout command for the current OS
+    
+    Returns:
+        str: timeout command ('timeout' on Linux, 'gtimeout' on macOS if available, None if not available)
+    """
+    system = platform.system()
+    
+    if system == "Linux":
+        if shutil.which("timeout"):
+            return "timeout"
+    elif system == "Darwin":  # macOS
+        # Try gtimeout first (from coreutils)
+        if shutil.which("gtimeout"):
+            return "gtimeout"
+        elif shutil.which("timeout"):
+            return "timeout"
+    
+    return None
+
+def run_with_timeout(cmd_list, timeout_seconds, **kwargs):
+    """
+    Run a command with timeout, handling cross-platform differences
+    
+    Args:
+        cmd_list (list): Command as list of strings
+        timeout_seconds (int): Timeout in seconds
+        **kwargs: Additional arguments for subprocess.run
+        
+    Returns:
+        subprocess.CompletedProcess: Result of subprocess.run
+    """
+    timeout_cmd = get_timeout_command()
+    
+    if timeout_cmd:
+        # Use system timeout command
+        full_cmd = [timeout_cmd, str(timeout_seconds)] + cmd_list
+    else:
+        # Fall back to subprocess timeout (less reliable for hanging processes)
+        full_cmd = cmd_list
+        kwargs['timeout'] = timeout_seconds + 2
+    
+    return subprocess.run(full_cmd, **kwargs)
 
 def diagnose_socat_failure(uri, timeout=10):
     """
@@ -64,10 +109,15 @@ def diagnose_socat_failure(uri, timeout=10):
     }
     
     try:
-        # Test 1: Basic TCP connectivity
+        # Test 1: Basic TCP connectivity (without SSL)
         print(f"    → Testing basic TCP connectivity to {hostname}:{port}")
-        cmd = ["timeout", str(timeout), "socat", "-", f"TCP:{hostname}:{port}"]
-        result = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=timeout + 2)
+        result = run_with_timeout(
+            ["socat", "-", f"TCP:{hostname}:{port}"], 
+            timeout,
+            input="", 
+            capture_output=True, 
+            text=True
+        )
         results["tests"]["tcp_connect"] = {
             "success": result.returncode == 0,
             "output": result.stdout[:200],
@@ -81,51 +131,81 @@ def diagnose_socat_failure(uri, timeout=10):
         if use_ssl:
             # Test 2: SSL connection with strict validation
             print(f"    → Testing SSL with strict certificate validation")
-            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port}"]
-            result = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=timeout + 2)
+            result = run_with_timeout(
+                ["socat", "-", f"SSL:{hostname}:{port}"], 
+                timeout,
+                input="", 
+                capture_output=True, 
+                text=True
+            )
             results["tests"]["ssl_strict"] = {
                 "success": result.returncode == 0,
                 "output": result.stdout[:200],
                 "error": result.stderr[:200]
             }
             
-            # Test 3: SSL connection with relaxed validation
-            print(f"    → Testing SSL with relaxed certificate validation")  
-            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port},verify=0"]
-            result = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=timeout + 2)
+            # Test 3: SSL connection with relaxed validation and better compatibility
+            print(f"    → Testing SSL with relaxed certificate validation")
+            ssl_options = f"SSL:{hostname}:{port},verify=0"
+            if platform.system() == "Darwin":  # macOS specific SSL options
+                ssl_options += ",method=TLS1.2"
+            
+            result = run_with_timeout(
+                ["socat", "-", ssl_options], 
+                timeout,
+                input="", 
+                capture_output=True, 
+                text=True
+            )
             results["tests"]["ssl_relaxed"] = {
                 "success": result.returncode == 0,
                 "output": result.stdout[:200],
                 "error": result.stderr[:200]
             }
             
-            # Test 4: SSL with SNI
+            # Test 4: SSL with SNI and compatibility options
             print(f"    → Testing SSL with Server Name Indication (SNI)")
-            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port},verify=0,servername={hostname}"]
-            result = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=timeout + 2)
+            ssl_sni_options = f"SSL:{hostname}:{port},verify=0,servername={hostname}"
+            if platform.system() == "Darwin":  # macOS
+                ssl_sni_options += ",method=TLS1.2"
+            
+            result = run_with_timeout(
+                ["socat", "-", ssl_sni_options], 
+                timeout,
+                input="", 
+                capture_output=True, 
+                text=True
+            )
             results["tests"]["ssl_sni"] = {
                 "success": result.returncode == 0,
                 "output": result.stdout[:200],
                 "error": result.stderr[:200]
             }
             
-            # Determine SSL diagnosis
-            if not results["tests"]["ssl_strict"]["success"] and results["tests"]["ssl_relaxed"]["success"]:
-                results["diagnosis"] = "SSL certificate validation issue - server uses invalid/self-signed certificate"
-            elif not results["tests"]["ssl_relaxed"]["success"] and results["tests"]["ssl_sni"]["success"]:
-                results["diagnosis"] = "SSL Server Name Indication (SNI) required"
-            elif not results["tests"]["ssl_sni"]["success"]:
-                results["diagnosis"] = "SSL connection issue - may be cipher suite or protocol version mismatch"
+            # Determine SSL diagnosis with macOS-specific handling
+            if not results["tests"]["ssl_strict"]["success"]:
+                if results["tests"]["ssl_relaxed"]["success"]:
+                    results["diagnosis"] = "SSL certificate validation issue - server uses invalid/self-signed certificate"
+                elif results["tests"]["ssl_sni"]["success"]:
+                    results["diagnosis"] = "SSL Server Name Indication (SNI) required"
+                elif platform.system() == "Darwin" and "SSL" in results["tests"]["ssl_strict"]["error"]:
+                    results["diagnosis"] = "macOS socat SSL compatibility issue - try updating socat or use 'brew install coreutils' for gtimeout"
+                else:
+                    results["diagnosis"] = "SSL connection issue - cipher suite or protocol version mismatch"
         
         # Test 5: HTTP request (non-WebSocket)
         print(f"    → Testing HTTP request (non-WebSocket)")
         http_request = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n"
-        if use_ssl:
-            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port},verify=0,servername={hostname}"]
-        else:
-            cmd = ["timeout", str(timeout), "socat", "-", f"TCP:{hostname}:{port}"]
         
-        result = subprocess.run(cmd, input=http_request, capture_output=True, text=True, timeout=timeout + 2)
+        if use_ssl:
+            ssl_options = f"SSL:{hostname}:{port},verify=0,servername={hostname}"
+            if platform.system() == "Darwin":
+                ssl_options += ",method=TLS1.2"
+            cmd = ["socat", "-", ssl_options]
+        else:
+            cmd = ["socat", "-", f"TCP:{hostname}:{port}"]
+        
+        result = run_with_timeout(cmd, timeout, input=http_request, capture_output=True, text=True)
         results["tests"]["http_request"] = {
             "success": result.returncode == 0 and "HTTP/" in result.stdout,
             "status_code": None,
@@ -147,11 +227,14 @@ def diagnose_socat_failure(uri, timeout=10):
         ws_request = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         
         if use_ssl:
-            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port},verify=0,servername={hostname}"]
+            ssl_options = f"SSL:{hostname}:{port},verify=0,servername={hostname}"
+            if platform.system() == "Darwin":
+                ssl_options += ",method=TLS1.2"
+            cmd = ["socat", "-", ssl_options]
         else:
-            cmd = ["timeout", str(timeout), "socat", "-", f"TCP:{hostname}:{port}"]
+            cmd = ["socat", "-", f"TCP:{hostname}:{port}"]
             
-        result = subprocess.run(cmd, input=ws_request, capture_output=True, text=True, timeout=timeout + 2)
+        result = run_with_timeout(cmd, timeout, input=ws_request, capture_output=True, text=True)
         results["tests"]["websocket_handshake"] = {
             "success": result.returncode == 0 and "101" in result.stdout,
             "output": result.stdout[:500],
@@ -218,19 +301,21 @@ def test_http_with_socat(uri, timeout=10):
         
         start_time = time.time()
         
-        # Setup socat command
+        # Setup socat command with cross-platform SSL options
         if use_ssl:
-            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port}"]
+            ssl_options = f"SSL:{hostname}:{port}"
+            if platform.system() == "Darwin":  # macOS needs more compatible SSL options
+                ssl_options += ",method=TLS1.2,verify=0"
+            cmd = ["socat", "-", ssl_options]
         else:
-            cmd = ["timeout", str(timeout), "socat", "-", f"TCP:{hostname}:{port}"]
+            cmd = ["socat", "-", f"TCP:{hostname}:{port}"]
         
-        # Run socat with HTTP request
-        result = subprocess.run(
+        result = run_with_timeout(
             cmd,
+            timeout,
             input=http_request,
             capture_output=True,
-            text=True,
-            timeout=timeout + 2
+            text=True
         )
         
         response_time = time.time() - start_time
@@ -303,19 +388,22 @@ def test_websocket_handshake_with_socat(uri, timeout=10):
         
         start_time = time.time()
         
-        # Setup socat command
+        # Setup socat command with cross-platform SSL options  
         if use_ssl:
-            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port}"]
+            ssl_options = f"SSL:{hostname}:{port}"
+            if platform.system() == "Darwin":  # macOS compatibility
+                ssl_options += ",method=TLS1.2,verify=0"
+            cmd = ["socat", "-", ssl_options]
         else:
-            cmd = ["timeout", str(timeout), "socat", "-", f"TCP:{hostname}:{port}"]
+            cmd = ["socat", "-", f"TCP:{hostname}:{port}"]
         
         # Run socat with WebSocket handshake
-        result = subprocess.run(
+        result = run_with_timeout(
             cmd,
+            timeout,
             input=request,
             capture_output=True,
-            text=True,
-            timeout=timeout + 2
+            text=True
         )
         
         response_time = time.time() - start_time
@@ -472,8 +560,11 @@ def test_with_external_tool(uri, tool_name, timeout=10):
             # wscat -c URL (connect and exit quickly)
             cmd = ["wscat", "-c", uri, "-w", "2"]  # 2 second wait
         elif tool_name == "websocat":
-            # websocat URL with timeout
-            cmd = ["timeout", str(timeout), "websocat", uri]
+            # websocat URL with timeout  
+            if get_timeout_command():
+                cmd = [get_timeout_command(), str(timeout), "websocat", uri]
+            else:
+                cmd = ["websocat", uri]
         else:
             return False, f"✗ Unsupported tool: {tool_name}", True
             
