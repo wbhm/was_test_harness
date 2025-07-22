@@ -397,20 +397,39 @@ def test_websocket_handshake_with_socat(uri, timeout=10):
         else:
             cmd = ["socat", "-", f"TCP:{hostname}:{port}"]
         
-        # Run socat with WebSocket handshake
-        result = run_with_timeout(
-            cmd,
-            timeout,
-            input=request,
-            capture_output=True,
-            text=True
-        )
+        # Run socat with WebSocket handshake (use binary mode to handle WebSocket frames)
+        try:
+            result = run_with_timeout(
+                cmd,
+                timeout,
+                input=request.encode('utf-8'),
+                capture_output=True
+            )
+            
+            # Try to decode response as text, but handle binary WebSocket frames
+            try:
+                response = result.stdout.decode('utf-8', errors='ignore')
+                stderr_text = result.stderr.decode('utf-8', errors='ignore') if result.stderr else ""
+            except:
+                # If decoding fails, work with raw bytes
+                response = str(result.stdout)
+                stderr_text = str(result.stderr) if result.stderr else ""
+                
+        except Exception as decode_error:
+            # Fallback to text mode if binary mode fails
+            result = run_with_timeout(
+                cmd,
+                timeout,
+                input=request,
+                capture_output=True,
+                text=True
+            )
+            response = result.stdout
+            stderr_text = result.stderr
         
         response_time = time.time() - start_time
         
         if result.returncode == 0:
-            response = result.stdout
-            
             # Check for successful WebSocket handshake
             if "HTTP/1.1 101" in response and "Switching Protocols" in response:
                 if f"Sec-WebSocket-Accept: {expected_key}" in response:
@@ -418,12 +437,18 @@ def test_websocket_handshake_with_socat(uri, timeout=10):
                 else:
                     return True, f"✓ WebSocket handshake successful but key mismatch ({response_time:.3f}s)", True
             elif "HTTP/1.1" in response:
-                status_line = response.split('\n')[0]
+                status_line = response.split('\n')[0] if '\n' in response else response[:100]
                 return False, f"✗ WebSocket handshake failed: {status_line.strip()}", True
+            elif len(response) > 0:
+                # Check if we got binary WebSocket frames (indicates successful handshake)
+                if response.startswith("b'") and ("\\x81" in response or "\\x82" in response):
+                    return True, f"✓ WebSocket handshake successful (binary frames received) ({response_time:.3f}s)", True
+                else:
+                    return False, f"✗ Unexpected response format: {response[:50]}...", True
             else:
                 return False, f"✗ No HTTP response received", True
         else:
-            error_msg = result.stderr.strip() if result.stderr else "Connection failed"
+            error_msg = stderr_text.strip() if stderr_text else "Connection failed"
             return False, f"✗ Connection failed: {error_msg[:100]}", True
             
     except subprocess.TimeoutExpired:
@@ -529,6 +554,60 @@ async def test_websocket(uri, timeout=15):
         response_time = time.time() - start_time
         return False, f"✗ Unexpected error: {type(e).__name__}: {str(e)}", response_time
 
+def test_with_websocat(uri, timeout=10):
+    """
+    Test WebSocket endpoint using websocat (proper WebSocket client)
+    
+    Args:
+        uri (str): WebSocket URI to test
+        timeout (int): Timeout in seconds
+        
+    Returns:
+        tuple: (success: bool, message: str, tool_available: bool)
+    """
+    if not shutil.which("websocat"):
+        return False, "✗ websocat not installed", False
+    
+    try:
+        start_time = time.time()
+        
+        # websocat with timeout and connection test
+        timeout_cmd = get_timeout_command()
+        if timeout_cmd:
+            cmd = [timeout_cmd, str(timeout), "websocat", "-t", uri, "-E"]
+        else:
+            cmd = ["websocat", "-t", uri, "-E"]
+        
+        # Test with a simple message
+        test_message = "test connection\n"
+        
+        result = subprocess.run(
+            cmd,
+            input=test_message,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 2
+        )
+        
+        response_time = time.time() - start_time
+        
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            if output:
+                return True, f"✓ WebSocket connected, echo received: {output[:50]}... ({response_time:.3f}s)", True
+            else:
+                return True, f"✓ WebSocket connected successfully ({response_time:.3f}s)", True
+        elif result.returncode == 124:  # timeout
+            return False, f"✗ Connection timeout ({timeout}s)", True
+        else:
+            error_msg = result.stderr.strip() or "Connection failed"
+            return False, f"✗ Failed: {error_msg[:100]}", True
+            
+    except subprocess.TimeoutExpired:
+        return False, f"✗ Process timeout ({timeout}s)", True
+    except Exception as e:
+        return False, f"✗ Error running websocat: {str(e)}", True
+
 def test_with_external_tool(uri, tool_name, timeout=10):
     """
     Test WebSocket endpoint using external command-line tools
@@ -542,8 +621,10 @@ def test_with_external_tool(uri, tool_name, timeout=10):
         tuple: (success: bool, message: str, tool_available: bool)
     """
     
-    # Handle socat variants
-    if tool_name == "socat-http":
+    # Handle different tools
+    if tool_name == "websocat":
+        return test_with_websocat(uri, timeout)
+    elif tool_name == "socat-http":
         return test_http_with_socat(uri, timeout)
     elif tool_name == "socat-websocket":
         return test_websocket_handshake_with_socat(uri, timeout)
@@ -560,11 +641,8 @@ def test_with_external_tool(uri, tool_name, timeout=10):
             # wscat -c URL (connect and exit quickly)
             cmd = ["wscat", "-c", uri, "-w", "2"]  # 2 second wait
         elif tool_name == "websocat":
-            # websocat URL with timeout  
-            if get_timeout_command():
-                cmd = [get_timeout_command(), str(timeout), "websocat", uri]
-            else:
-                cmd = ["websocat", uri]
+            # This case is handled by test_with_websocat function above
+            return test_with_websocat(uri, timeout)
         else:
             return False, f"✗ Unsupported tool: {tool_name}", True
             
@@ -607,7 +685,7 @@ async def test_all_endpoints():
     available_tools = []
     tool_configs = [
         ("wscat", "wscat"),
-        ("websocat", "websocat"), 
+        ("websocat", "websocat"),
         ("socat-http", "socat"),
         ("socat-websocket", "socat")
     ]
@@ -622,16 +700,19 @@ async def test_all_endpoints():
         print("No external tools found - using Python websockets only")
         print("Install tools:")
         print("  wscat: npm install -g wscat")
-        print("  websocat: download binary from GitHub") 
-        print("  socat: sudo apt install socat")
+        print("  websocat: cargo install websocat OR download from https://github.com/vi/websocat/releases")
+        print("  socat: sudo apt install socat (Linux) OR brew install socat (macOS)")
     print()
     
-    # Add explanatory note about dual socat testing
+    # Add explanatory notes about different tools
+    if "websocat" in available_tools:
+        print("Note: websocat is a dedicated WebSocket client (recommended)")
     if "socat-http" in available_tools or "socat-websocket" in available_tools:
-        print("Note: socat tests both HTTP and WebSocket protocols separately")
+        print("Note: socat provides low-level protocol testing")
         print("  socat-http: Basic HTTP connectivity test") 
-        print("  socat-websocket: Full WebSocket handshake test")
-        print()
+        print("  socat-websocket: Raw WebSocket handshake test")
+    if "websocat" in available_tools or "socat-http" in available_tools:
+        print()  # Add spacing if we printed notes
     
     results = []
     
