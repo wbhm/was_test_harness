@@ -25,6 +25,165 @@ ENDPOINTS = [
     "wss://api.enterprise.uneeq.io/signalling-service/v2/ws/renderer"
 ]
 
+def diagnose_socat_failure(uri, timeout=10):
+    """
+    Systematically diagnose why socat failed when Python websockets succeeded
+    
+    Args:
+        uri (str): WebSocket URI to test
+        timeout (int): Timeout in seconds
+        
+    Returns:
+        dict: Detailed diagnostic results
+    """
+    if not shutil.which("socat"):
+        return {"available": False, "reason": "socat not installed"}
+    
+    # Parse URI
+    if uri.startswith("wss://"):
+        hostname = uri[6:].split('/')[0].split(':')[0]
+        port = uri[6:].split('/')[0].split(':')[1] if ':' in uri[6:].split('/')[0] else "443"
+        path = '/' + '/'.join(uri[6:].split('/')[1:]) if len(uri[6:].split('/')) > 1 else '/'
+        use_ssl = True
+    elif uri.startswith("ws://"):
+        hostname = uri[5:].split('/')[0].split(':')[0]
+        port = uri[5:].split('/')[0].split(':')[1] if ':' in uri[5:].split('/')[0] else "80"
+        path = '/' + '/'.join(uri[5:].split('/')[1:]) if len(uri[5:].split('/')) > 1 else '/'
+        use_ssl = False
+    else:
+        return {"available": True, "tests": {}, "diagnosis": "Unsupported URL scheme"}
+    
+    results = {
+        "available": True,
+        "hostname": hostname,
+        "port": port,
+        "path": path,
+        "use_ssl": use_ssl,
+        "tests": {},
+        "diagnosis": "Unknown"
+    }
+    
+    try:
+        # Test 1: Basic TCP connectivity
+        print(f"    → Testing basic TCP connectivity to {hostname}:{port}")
+        cmd = ["timeout", str(timeout), "socat", "-", f"TCP:{hostname}:{port}"]
+        result = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=timeout + 2)
+        results["tests"]["tcp_connect"] = {
+            "success": result.returncode == 0,
+            "output": result.stdout[:200],
+            "error": result.stderr[:200]
+        }
+        
+        if not results["tests"]["tcp_connect"]["success"]:
+            results["diagnosis"] = "Network connectivity issue - TCP connection failed"
+            return results
+        
+        if use_ssl:
+            # Test 2: SSL connection with strict validation
+            print(f"    → Testing SSL with strict certificate validation")
+            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port}"]
+            result = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=timeout + 2)
+            results["tests"]["ssl_strict"] = {
+                "success": result.returncode == 0,
+                "output": result.stdout[:200],
+                "error": result.stderr[:200]
+            }
+            
+            # Test 3: SSL connection with relaxed validation
+            print(f"    → Testing SSL with relaxed certificate validation")  
+            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port},verify=0"]
+            result = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=timeout + 2)
+            results["tests"]["ssl_relaxed"] = {
+                "success": result.returncode == 0,
+                "output": result.stdout[:200],
+                "error": result.stderr[:200]
+            }
+            
+            # Test 4: SSL with SNI
+            print(f"    → Testing SSL with Server Name Indication (SNI)")
+            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port},verify=0,servername={hostname}"]
+            result = subprocess.run(cmd, input="", capture_output=True, text=True, timeout=timeout + 2)
+            results["tests"]["ssl_sni"] = {
+                "success": result.returncode == 0,
+                "output": result.stdout[:200],
+                "error": result.stderr[:200]
+            }
+            
+            # Determine SSL diagnosis
+            if not results["tests"]["ssl_strict"]["success"] and results["tests"]["ssl_relaxed"]["success"]:
+                results["diagnosis"] = "SSL certificate validation issue - server uses invalid/self-signed certificate"
+            elif not results["tests"]["ssl_relaxed"]["success"] and results["tests"]["ssl_sni"]["success"]:
+                results["diagnosis"] = "SSL Server Name Indication (SNI) required"
+            elif not results["tests"]["ssl_sni"]["success"]:
+                results["diagnosis"] = "SSL connection issue - may be cipher suite or protocol version mismatch"
+        
+        # Test 5: HTTP request (non-WebSocket)
+        print(f"    → Testing HTTP request (non-WebSocket)")
+        http_request = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n"
+        if use_ssl:
+            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port},verify=0,servername={hostname}"]
+        else:
+            cmd = ["timeout", str(timeout), "socat", "-", f"TCP:{hostname}:{port}"]
+        
+        result = subprocess.run(cmd, input=http_request, capture_output=True, text=True, timeout=timeout + 2)
+        results["tests"]["http_request"] = {
+            "success": result.returncode == 0 and "HTTP/" in result.stdout,
+            "status_code": None,
+            "output": result.stdout[:500],
+            "error": result.stderr[:200]
+        }
+        
+        # Parse HTTP status code
+        if results["tests"]["http_request"]["success"] and "HTTP/" in result.stdout:
+            try:
+                status_line = result.stdout.split('\n')[0]
+                results["tests"]["http_request"]["status_code"] = status_line.split()[1]
+            except:
+                pass
+        
+        # Test 6: WebSocket handshake
+        print(f"    → Testing WebSocket handshake")
+        key = base64.b64encode(os.urandom(16)).decode('utf-8')
+        ws_request = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        
+        if use_ssl:
+            cmd = ["timeout", str(timeout), "socat", "-", f"SSL:{hostname}:{port},verify=0,servername={hostname}"]
+        else:
+            cmd = ["timeout", str(timeout), "socat", "-", f"TCP:{hostname}:{port}"]
+            
+        result = subprocess.run(cmd, input=ws_request, capture_output=True, text=True, timeout=timeout + 2)
+        results["tests"]["websocket_handshake"] = {
+            "success": result.returncode == 0 and "101" in result.stdout,
+            "output": result.stdout[:500],
+            "error": result.stderr[:200]
+        }
+        
+        # Final diagnosis based on all tests
+        if use_ssl and results["diagnosis"] != "Unknown":
+            pass  # SSL diagnosis already set
+        elif results["tests"]["http_request"]["success"]:
+            status_code = results["tests"]["http_request"]["status_code"]
+            if status_code == "404":
+                results["diagnosis"] = "WebSocket endpoint path not found - server responds to HTTP but WebSocket path doesn't exist"
+            elif status_code == "405":
+                results["diagnosis"] = "Server configuration - endpoint exists but doesn't support WebSocket upgrade"
+            elif status_code in ["200", "301", "302"]:
+                if not results["tests"]["websocket_handshake"]["success"]:
+                    results["diagnosis"] = "WebSocket protocol compliance - server accepts HTTP but rejects WebSocket handshake headers"
+                else:
+                    results["diagnosis"] = "WebSocket handshake validation - server handshake response doesn't match expected format"
+            else:
+                results["diagnosis"] = f"HTTP server error - status code {status_code}"
+        else:
+            results["diagnosis"] = "HTTP protocol issue - server doesn't respond to HTTP requests properly"
+            
+    except subprocess.TimeoutExpired:
+        results["diagnosis"] = "Connection timeout - server too slow to respond"
+    except Exception as e:
+        results["diagnosis"] = f"Diagnostic error: {str(e)}"
+    
+    return results
+
 def test_http_with_socat(uri, timeout=10):
     """
     Test basic HTTP connectivity using socat (before WebSocket upgrade)
@@ -55,12 +214,7 @@ def test_http_with_socat(uri, timeout=10):
             return False, "✗ Unsupported URL scheme", True
             
         # Create simple HTTP GET request (not WebSocket upgrade)
-        http_request = f"""GET {path} HTTP/1.1\r
-Host: {hostname}\r
-Connection: close\r
-User-Agent: socat-http-test\r
-\r
-"""
+        http_request = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\nUser-Agent: socat-http-test\r\n\r\n"
         
         start_time = time.time()
         
@@ -141,14 +295,7 @@ def test_websocket_handshake_with_socat(uri, timeout=10):
         key = base64.b64encode(os.urandom(16)).decode('utf-8')
         
         # Create HTTP request for WebSocket upgrade
-        request = f"""GET {path} HTTP/1.1\r
-Host: {hostname}\r
-Upgrade: websocket\r
-Connection: Upgrade\r
-Sec-WebSocket-Key: {key}\r
-Sec-WebSocket-Version: 13\r
-\r
-"""
+        request = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         
         # Expected response key for validation
         magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -412,6 +559,28 @@ async def test_all_endpoints():
             if tool_available:
                 results.append((tool, uri, success, message, 0))
                 print(f"[{tool}] {message}")
+                
+                # If socat failed but Python succeeded, run detailed diagnosis
+                if not success and (tool == "socat-http" or tool == "socat-websocket"):
+                    # Check if Python websockets succeeded for this URI
+                    python_success = any(r[2] for r in results if r[0] == 'Python websockets' and r[1] == uri)
+                    if python_success:
+                        print(f"    🔍 Diagnosing socat failure (Python websockets worked)...")
+                        diagnosis = diagnose_socat_failure(uri)
+                        if diagnosis.get("available", False):
+                            print(f"    📋 DIAGNOSIS: {diagnosis['diagnosis']}")
+                            
+                            # Show key test results
+                            tests = diagnosis.get("tests", {})
+                            if "ssl_strict" in tests and not tests["ssl_strict"]["success"] and tests.get("ssl_relaxed", {}).get("success", False):
+                                print(f"    ├── SSL certificate issue detected")
+                            if "http_request" in tests:
+                                status = tests["http_request"].get("status_code")
+                                if status:
+                                    print(f"    ├── HTTP status code: {status}")
+                            if "websocket_handshake" in tests and not tests["websocket_handshake"]["success"]:
+                                print(f"    └── WebSocket handshake failed")
+                        print()
         
         print()
     
